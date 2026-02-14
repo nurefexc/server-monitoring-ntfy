@@ -83,6 +83,7 @@ The following environment variables are supported:
 | `RAM_LIMIT` | RAM usage alert threshold (%) | `92` |
 | `DAILY_TIME` | Time for scheduled reports (HH:MM) | `08:00` |
 | `CHECK_INTERVAL`| Polling frequency in seconds | `60` |
+| `TZ` | System timezone (e.g., `Europe/Budapest`) | `UTC` |
 
 ## Notification Types Supported
 

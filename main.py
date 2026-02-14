@@ -28,6 +28,12 @@ logger = logging.getLogger("NomadMonitor")
 NTFY_URL: str = os.getenv("NTFY_URL", "")
 NTFY_TOKEN: Optional[str] = os.getenv("NTFY_TOKEN")
 HOSTNAME: str = os.getenv("HOSTNAME", socket.gethostname())
+TIMEZONE: str = os.getenv("TZ", "UTC")
+
+# Set local timezone
+os.environ['TZ'] = TIMEZONE
+if hasattr(time, 'tzset'):
+    time.tzset()
 
 # Thresholds and timings
 TEMP_LIMIT: int = int(os.getenv("TEMP_LIMIT", "82"))
