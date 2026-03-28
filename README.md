@@ -28,11 +28,24 @@ A lightweight Python script that monitors system resources, Docker containers, e
    docker-compose up -d
    ```
 
-### Permission Notes
-To access the Docker socket (`/var/run/docker.sock`), the container needs proper permissions. If you see `[Errno 13] Permission denied` in logs:
+### Permission & Log Notes
+To access the Docker socket or system logs, the container needs proper permissions.
+
+**Docker Socket:** If you see `[Errno 13] Permission denied` in logs:
 1. Check the docker group GID on the host: `getent group docker | cut -d: -f3`
 2. Set the `user` field in `docker-compose.yml` (e.g., `user: "1000:999"`, where 999 is the GID).
-3. Alternatively, run as root: `user: "root"` (less secure but easiest).
+3. Alternatively, run as root: `user: "root"`.
+
+**System Logs & systemd-journald:**
+- **Debian 12+:** May not have `/var/log/syslog`. Install `rsyslog` or use journal monitoring.
+- **Other Systems (Arch, Fedora, etc.):** Often use only `systemd-journald`.
+- To monitor the journal, set `use_journal: true` in `config.yaml` and ensure the journal is mounted in `docker-compose.yml`:
+  ```yaml
+  volumes:
+    - /var/log/journal:/var/log/journal:ro
+    - /run/systemd/journal/socket:/run/systemd/journal/socket:ro
+  ```
+- Make sure `systemd` (providing `journalctl`) is included in the image (it is included in the provided Dockerfile).
 
 ### docker-compose.yml example:
 ```yaml

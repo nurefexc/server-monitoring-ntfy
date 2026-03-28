@@ -18,8 +18,8 @@ LABEL description="Server monitoring application with ntfy notifications"
 
 WORKDIR /app
 
-# Install tzdata and procps (for healthcheck)
-RUN apt-get update && apt-get install -y --no-install-recommends tzdata procps && \
+# Install tzdata and procps (for healthcheck) and systemd (for journalctl)
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata procps systemd && \
     rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user

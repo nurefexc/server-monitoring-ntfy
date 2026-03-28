@@ -45,21 +45,41 @@ services:
     ssl_days_before: 7
 
 # Log file monitoring
-# The application watches these files for keywords/patterns
+# The application watches these files for keywords/patterns.
+# Note: On Debian 12+, rsyslog is not installed by default. 
+# You might need to install it (apt install rsyslog) or monitor other log files.
 logs:
   watch_files:
-    - path: "/var/log/auth.log"
+    - path: "/var/log/auth.log" # SSH logins
       patterns:
         - name: "SSH Login"
           regex: "Accepted (password|publickey) for .* from .*"
           priority: "4"
           tags: "key,lock"
-    - path: "/var/log/syslog"
+    - path: "/var/log/syslog" # System logs (requires rsyslog)
       patterns:
         - name: "System Error"
           regex: ".*(ERROR|FATAL|CRITICAL).*"
           priority: "4"
           tags: "warning"
+    - path: "/var/log/daemon.log" # Daemon specific logs
+      patterns:
+        - name: "Daemon Error"
+          regex: ".*(error|fail).*"
+          priority: "4"
+          tags: "gear"
+  
+  # systemd journal monitoring (Alternative for systems without text log files)
+  use_journal: true
+  journal_patterns:
+    - name: "SSH Login"
+      regex: "Accepted (password|publickey) for .* from .*"
+      priority: "4"
+      tags: "key,lock"
+    - name: "Kernel Error"
+      regex: ".*(ERROR|FATAL|CRITICAL).*"
+      priority: "4"
+      tags: "warning"
 
 # Backup monitoring
 backups:

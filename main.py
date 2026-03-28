@@ -58,6 +58,8 @@ DEFAULT_CONFIG = {
     "services": [],
     "logs": {
         "watch_files": [],
+        "use_journal": False,
+        "journal_patterns": []
     },
     "backups": []
 }
@@ -86,7 +88,13 @@ def load_config() -> Dict[str, Any]:
     if os.getenv("HOSTNAME"): config["monitoring"]["hostname"] = os.getenv("HOSTNAME")
     if os.getenv("TZ"): config["monitoring"]["timezone"] = os.getenv("TZ")
     if os.getenv("DAILY_TIME"): config["monitoring"]["daily_time"] = os.getenv("DAILY_TIME")
-    if os.getenv("CHECK_INTERVAL"): config["monitoring"]["check_interval"] = int(os.getenv("CHECK_INTERVAL") or 60)
+    
+    # Check interval from env, with fallback to config value
+    if os.getenv("CHECK_INTERVAL"):
+        try:
+            config["monitoring"]["check_interval"] = int(os.getenv("CHECK_INTERVAL"))
+        except ValueError:
+            pass
 
     os.environ['TZ'] = config["monitoring"]["timezone"]
     if hasattr(time, 'tzset'):
@@ -471,10 +479,16 @@ async def check_backups():
 async def tail_log(file_cfg: Dict):
     path = file_cfg.get("path")
     patterns = file_cfg.get("patterns", [])
-    if not os.path.exists(path):
-        logger.warning(f"Log not found: {path}")
-        return
+    
+    # Wait for the file to exist before starting to tail
+    # This is helpful if the file is created after the script starts
+    while not os.path.exists(path):
+        # Check if we should even keep trying (e.g., if the path is fundamentally wrong)
+        # But for now, we just wait as it might be a mounted volume that's slow.
+        logger.warning(f"Log file not found: {path}. Retrying in 60s...")
+        await asyncio.sleep(60)
 
+    logger.info(f"Started monitoring log file: {path}")
     try:
         with open(path, 'r') as f:
             f.seek(0, 2)
@@ -494,6 +508,39 @@ async def tail_log(file_cfg: Dict):
                         )
     except Exception as e:
         logger.error(f"Error tailing {path}: {e}")
+
+async def monitor_journal():
+    """Monitors systemd journal if available."""
+    patterns = config["logs"].get("journal_patterns", [])
+    if not patterns:
+        return
+
+    logger.info("Started monitoring systemd journal via journalctl")
+    try:
+        # We use journalctl -f to tail the journal
+        process = await asyncio.create_subprocess_exec(
+            'journalctl', '-f', '-o', 'cat',
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        while True:
+            line_bytes = await process.stdout.readline()
+            if not line_bytes:
+                break
+            line = line_bytes.decode('utf-8', errors='ignore').strip()
+            
+            for p in patterns:
+                if re.search(p.get("regex", ""), line):
+                    await send_ntfy(
+                        f"JOURNAL: {p.get('name', 'Pattern Match')}",
+                        f"Match: {line}",
+                        p.get("priority", "4"),
+                        p.get("tags", "mag_right")
+                    )
+    except Exception as e:
+        logger.error(f"Journal monitoring error: {e}. Ensure 'journalctl' is installed and journal is mounted.")
+        await asyncio.sleep(60)
 
 # --- MAIN LOGIC ---
 async def check_critical():
@@ -564,8 +611,14 @@ async def main():
     # Background tasks
     tasks = []
     tasks.append(asyncio.create_task(monitor_docker_events()))
+    
+    # 1. File logs
     for log_cfg in config["logs"].get("watch_files", []):
         tasks.append(asyncio.create_task(tail_log(log_cfg)))
+    
+    # 2. Systemd Journal
+    if config["logs"].get("use_journal"):
+        tasks.append(asyncio.create_task(monitor_journal()))
 
     last_disk_check = 0
     last_service_check = 0
