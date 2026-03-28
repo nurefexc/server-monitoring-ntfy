@@ -16,8 +16,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends tzdata && \
     rm -rf /var/lib/apt/lists/* && \
     pip install --no-cache-dir -r requirements.txt
 
+# Create a non-root user
+RUN groupadd -r monitor && useradd -r -g monitor monitor
+
 # Copy application code
 COPY main.py .
+
+# Ensure the user has access to the app directory
+RUN chown -R monitor:monitor /app
+
+# Run as non-root
+USER monitor
 
 # Run the application
 CMD ["python", "main.py"]
