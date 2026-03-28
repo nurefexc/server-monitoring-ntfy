@@ -1,0 +1,33 @@
+# ntfy értesítési beállítások
+ntfy:
+  url: "https://ntfy.sh/valami_egyedi_topic" # Cseréld le a sajátodra!
+  # token: "tk_..." # Ha használsz hitelesítést
+  priority: "3"
+  tags: "bar_chart"
+
+# Riasztási küszöbértékek
+limits:
+  temp: 82        # Celsius
+  disk: 90        # %
+  ram: 92         # %
+  net_mbps: 100   # Hálózati forgalom limit (Mbps)
+
+# Általános monitorozási beállítások
+monitoring:
+  hostname: "SajatSzerver"
+  timezone: "Europe/Budapest"
+  daily_time: "08:00"      # Mikor küldjön napi összefoglalót
+  check_interval: 60       # Ellenőrzés gyakorisága (másodperc)
+  quiet_hours: "23:00-06:00" # Ebben az időszakban csak a kritikus riasztások jönnek meg
+
+# Docker specifikus beállítások
+docker:
+  auto_restart: true    # Ha egy konténer hibával áll le, próbálja meg újraindítani
+  monitor_health: true  # Figyelje a Docker Healthcheck állapotokat (unhealthy)
+
+# Log fájlok figyelése
+# Az alkalmazás figyeli ezeket a fájlokat ERROR és FATAL kulcsszavakra
+logs:
+  watch_files:
+    # - "/var/log/syslog"
+    # - "/app/logs/myapp.log"

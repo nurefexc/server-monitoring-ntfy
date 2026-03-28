@@ -19,59 +19,61 @@ A lightweight Python script that monitors system resources and Docker containers
 1. **ntfy Topic:** Create a topic on [ntfy.sh](https://ntfy.sh) (e.g., `my_server_monitor`).
 2. **Docker Socket (Optional):** To monitor container crashes, the script needs access to `/var/run/docker.sock`.
 
-## Setup & Installation
+- **Öngyógyítás (Self-Healing):** Automatikus konténer újraindítás, ha hibával áll le.
+- **Hálózati monitorozás:** Figyeli a forgalmat (Mbps) és riaszt, ha túl magas.
+- **Log figyelés:** Képes log fájlokban keresni kritikus hibákat (ERROR, FATAL).
+- **Csendes mód (Quiet Hours):** Éjszaka csak a kritikus riasztások jönnek meg.
+- **YAML konfiguráció:** Könnyen kezelhető beállítások fájlból.
 
-### Option 1: Using Docker (Recommended)
+## Használat Docker Compose-al (Ajánlott)
 
-The easiest way to run the monitor is using the official Docker image:
+A legkényelmesebb futtatási mód a Docker Compose használata.
 
-1. Pull the image from Docker Hub:
+1. Másold le a `docker-compose.yml` fájlt.
+2. Hozz létre egy `config.yaml` fájlt a `config.yaml.example` alapján.
+3. Indítsd el:
    ```bash
-   docker pull nurefexc/server-monitoring-ntfy:latest
-   ```
-2. Run the container:
-   ```bash
-   docker run -d \
-     --name server-monitor \
-     --restart always \
-     -v /var/run/docker.sock:/var/run/docker.sock:ro \
-     -e NTFY_URL=https://ntfy.sh/your_topic \
-     nurefexc/server-monitoring-ntfy:latest
-   ```
-   *Note: Mounting the Docker socket as read-only (`:ro`) is required for container monitoring.*
-
-### Option 2: Build Locally
-If you want to build the image yourself:
-1. Clone this repository.
-2. Build the image:
-   ```bash
-   docker build -t nurefexc/server-monitoring-ntfy:latest .
-   ```
-3. Run the container as shown in Option 1.
-
-## CI/CD (Automation)
-
-This repository includes a GitHub Action that automatically builds and pushes the Docker image to **Docker Hub** whenever you push to the `master` branch.
-
-To enable this, add the following **Secrets** to your GitHub repository (`Settings > Secrets and variables > Actions`):
-- `DOCKERHUB_USERNAME`: Your Docker Hub username.
-- `DOCKERHUB_TOKEN`: Your Docker Hub Personal Access Token (PAT).
-
-### Option 3: Manual Installation
-
-1. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-2. Set environment variables (see `.env.sample`).
-3. Run the script:
-   ```bash
-   python main.py
+   docker-compose up -d
    ```
 
-## Configuration
+### Megjegyzés a jogosultságokról
+A Docker socket (`/var/run/docker.sock`) eléréséhez a konténernek megfelelő jogosultságokkal kell rendelkeznie. Ha `[Errno 13] Permission denied` hibát látsz a logokban:
+1. Ellenőrizd a host gépen a docker csoport GID-jét: `getent group docker | cut -d: -f3`
+2. Állítsd be a `docker-compose.yml`-ben a `user` mezőt (pl. `user: "1000:999"`, ahol 999 a kapott GID).
+3. Vagy futtasd a konténert rootként: `user: "root"` (kevésbé biztonságos).
 
-The following environment variables are supported:
+### docker-compose.yml példa:
+```yaml
+services:
+  monitoring:
+    image: nurefexc/server-monitoring-ntfy:latest
+    container_name: server-monitor
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /proc:/proc:ro
+      - /sys:/sys:ro
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - TZ=Europe/Budapest
+      - CONFIG_PATH=/app/config.yaml
+```
+
+## Konfiguráció (YAML)
+
+A `config.yaml` fájlban minden paraméter finomhangolható:
+
+| Szakasz | Paraméter | Leírás | Alapértelmezett |
+|---------|-----------|--------|-----------------|
+| `ntfy` | `url` | ntfy topic URL | - |
+| `limits` | `temp` | CPU hőmérséklet limit (°C) | `82` |
+| `limits` | `ram` | RAM használat limit (%) | `92` |
+| `limits` | `net_mbps` | Hálózati forgalom limit (Mbps) | `100` |
+| `monitoring` | `quiet_hours` | Csendes időszak (pl. "23:00-06:00") | `null` |
+| `docker` | `auto_restart` | Automatikus újraindítás | `false` |
+
+## Környezeti változók
+A visszamenőleges kompatibilitás érdekében az alábbi környezeti változók is használhatóak:
 
 | Variable | Description | Default |
 |----------|-------------|---------|

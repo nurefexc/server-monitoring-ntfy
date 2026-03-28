@@ -171,8 +171,13 @@ def monitor_docker_events() -> None:
     """
     socket_path = "/var/run/docker.sock"
     if not os.path.exists(socket_path):
-        logger.warning("Docker socket not found at /var/run/docker.sock. Container monitoring disabled.")
+        logger.warning(f"Docker socket not found at {socket_path}. Container monitoring disabled.")
         return
+    
+    if not os.access(socket_path, os.R_OK | os.W_OK):
+        logger.error(f"Permission denied for Docker socket at {socket_path}. Check your user/group IDs.")
+        # We don't return here to allow the while loop to retry (maybe permissions change?)
+        # but we could also return if we want to stop early.
 
     logger.info("Docker Event Monitor thread active.")
     
