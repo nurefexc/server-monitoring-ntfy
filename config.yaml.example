@@ -1,36 +1,68 @@
-# ntfy értesítési beállítások
+# ntfy notification settings
 ntfy:
-  url: "https://ntfy.sh/valami_egyedi_topic" # Cseréld le a sajátodra!
-  # token: "tk_..." # Ha használsz hitelesítést
+  url: "https://ntfy.sh/your_unique_topic" # Replace with your own!
+  # token: "tk_..." # If you use authentication
   priority: "3"
   tags: "bar_chart"
 
-# Riasztási küszöbértékek
+# Alert thresholds
 limits:
-  temp: 82        # Celsius
-  disk: 90        # %
-  ram: 92         # %
-  net_mbps: 100   # Hálózati forgalom limit (Mbps)
-  swap: 80        # Swap használat limit (%)
-  inode: 90       # Inode használat limit (%)
+  temp: 
+    warning: 75
+    critical: 85
+  disk: 
+    warning: 85
+    critical: 95
+  ram: 
+    warning: 80
+    critical: 90
+  net_mbps: 100   # Network traffic limit (Mbps)
+  swap: 80        # Swap usage limit (%)
+  inode: 90       # Inode usage limit (%)
 
-# Általános monitorozási beállítások
+# General monitoring settings
 monitoring:
-  hostname: "SajatSzerver"
-  timezone: "Europe/Budapest"
-  daily_time: "08:00"      # Mikor küldjön napi összefoglalót
-  check_interval: 60       # Ellenőrzés gyakorisága (másodperc)
-  quiet_hours: "23:00-06:00" # Ebben az időszakban csak a kritikus riasztások jönnek meg
-  heartbeat_file: "/tmp/heartbeat" # Docker healthcheck fájl útvonala
+  hostname: "MyServer"
+  timezone: "UTC"
+  daily_time: "08:00"      # When to send daily summary
+  check_interval: 60       # Frequency of checks (seconds)
+  quiet_hours: "23:00-06:00" # Only critical alerts during this period
+  heartbeat_file: "/tmp/heartbeat" # Docker healthcheck file path
 
-# Docker specifikus beállítások
+# Docker specific settings
 docker:
-  auto_restart: true    # Ha egy konténer hibával áll le, próbálja meg újraindítani
-  monitor_health: true  # Figyelje a Docker Healthcheck állapotokat (unhealthy)
+  auto_restart: true    # Try to restart if a container exits with error
+  monitor_health: true  # Monitor Docker Healthcheck statuses (unhealthy)
 
-# Log fájlok figyelése
-# Az alkalmazás figyeli ezeket a fájlokat ERROR és FATAL kulcsszavakra
+# External URL/Service checks
+services:
+  - name: "Google"
+    url: "https://www.google.com"
+    expected_status: 200
+  - name: "My Website"
+    url: "https://example.com"
+    check_ssl: true
+    ssl_days_before: 7
+
+# Log file monitoring
+# The application watches these files for keywords/patterns
 logs:
   watch_files:
-    # - "/var/log/syslog"
-    # - "/app/logs/myapp.log"
+    - path: "/var/log/auth.log"
+      patterns:
+        - name: "SSH Login"
+          regex: "Accepted (password|publickey) for .* from .*"
+          priority: "4"
+          tags: "key,lock"
+    - path: "/var/log/syslog"
+      patterns:
+        - name: "System Error"
+          regex: ".*(ERROR|FATAL|CRITICAL).*"
+          priority: "4"
+          tags: "warning"
+
+# Backup monitoring
+backups:
+  - name: "Daily DB Backup"
+    path: "/backups/db_latest.sql"
+    max_age_hours: 25

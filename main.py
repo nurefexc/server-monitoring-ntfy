@@ -1,18 +1,22 @@
 import os
 import time
-import requests
-import schedule
-import logging
-import threading
+import asyncio
+import aiohttp
+import yaml
 import json
 import socket
-import yaml
-from datetime import datetime
+import logging
+import threading
+import re
+import ssl
+from datetime import datetime, timedelta
 from typing import Dict, Tuple, List, Optional, Any
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
 
 """
-Server monitoring application with ntfy notifications.
-Monitors system resources (CPU temperature, RAM, Disk) and Docker containers.
+Advanced Server Monitoring Application with ntfy notifications.
+Supports system resources, Docker, external services, log patterns, and SSL.
 """
 
 # --- LOGGING CONFIGURATION ---
@@ -22,9 +26,9 @@ logging.basicConfig(
     style='{',
     datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger("NomadMonitor")
+logger = logging.getLogger("ServerMonitor")
 
-# --- CONFIGURATION ---
+# --- DEFAULT CONFIGURATION ---
 DEFAULT_CONFIG = {
     "ntfy": {
         "url": "",
@@ -33,28 +37,30 @@ DEFAULT_CONFIG = {
         "tags": "bar_chart"
     },
     "limits": {
-        "temp": 82,
-        "disk": 90,
-        "ram": 92,
-        "net_mbps": 100,  # New: Network limit in Mbps
-        "swap": 80,       # New: Swap usage limit (%)
-        "inode": 90,      # New: Inode usage limit (%)
+        "temp": {"warning": 75, "critical": 85},
+        "disk": {"warning": 85, "critical": 95},
+        "ram": {"warning": 80, "critical": 90},
+        "net_mbps": 100,
+        "swap": 80,
+        "inode": 90,
     },
     "monitoring": {
         "hostname": socket.gethostname(),
         "timezone": "UTC",
         "daily_time": "08:00",
         "check_interval": 60,
-        "quiet_hours": None, # Format: "23:00-06:00"
-        "heartbeat_file": "/tmp/heartbeat", # New: For Docker healthcheck
+        "quiet_hours": None,
+        "heartbeat_file": "/tmp/heartbeat",
     },
     "docker": {
         "auto_restart": False,
         "monitor_health": True,
     },
+    "services": [],
     "logs": {
-        "watch_files": [], # List of files to monitor for "ERROR", "FATAL"
-    }
+        "watch_files": [],
+    },
+    "backups": []
 }
 
 def load_config() -> Dict[str, Any]:
@@ -66,7 +72,6 @@ def load_config() -> Dict[str, Any]:
             with open(config_path, 'r') as f:
                 user_config = yaml.safe_load(f)
                 if user_config:
-                    # Deep merge would be better, but simple for now
                     for section, values in user_config.items():
                         if section in config and isinstance(config[section], dict):
                             config[section].update(values)
@@ -76,19 +81,14 @@ def load_config() -> Dict[str, Any]:
         except Exception as e:
             logger.error(f"Error loading config file: {e}")
 
-    # Override with Environment Variables (backwards compatibility)
+    # Legacy Environment Variable Overrides
     if os.getenv("NTFY_URL"): config["ntfy"]["url"] = os.getenv("NTFY_URL")
     if os.getenv("NTFY_TOKEN"): config["ntfy"]["token"] = os.getenv("NTFY_TOKEN")
     if os.getenv("HOSTNAME"): config["monitoring"]["hostname"] = os.getenv("HOSTNAME")
     if os.getenv("TZ"): config["monitoring"]["timezone"] = os.getenv("TZ")
-    if os.getenv("TEMP_LIMIT"): config["limits"]["temp"] = int(os.getenv("TEMP_LIMIT"))
-    if os.getenv("DISK_LIMIT"): config["limits"]["disk"] = int(os.getenv("DISK_LIMIT"))
-    if os.getenv("RAM_LIMIT"): config["limits"]["ram"] = int(os.getenv("RAM_LIMIT"))
     if os.getenv("DAILY_TIME"): config["monitoring"]["daily_time"] = os.getenv("DAILY_TIME")
     if os.getenv("CHECK_INTERVAL"): config["monitoring"]["check_interval"] = int(os.getenv("CHECK_INTERVAL"))
-    if os.getenv("AUTO_RESTART"): config["docker"]["auto_restart"] = os.getenv("AUTO_RESTART").lower() == "true"
 
-    # Set local timezone
     os.environ['TZ'] = config["monitoring"]["timezone"]
     if hasattr(time, 'tzset'):
         try:
@@ -103,9 +103,11 @@ config = load_config()
 # Global state
 current_disk_stats: Dict[str, float] = {}
 current_inode_stats: Dict[str, float] = {}
-last_net_bytes: Dict[str, Tuple[float, int]] = {} # {interface: (timestamp, bytes)}
-last_cpu_times: Tuple[int, int] = (0, 0) # (idle, total)
+last_net_bytes: Dict[str, Tuple[float, int]] = {} 
+last_cpu_times: Tuple[int, int] = (0, 0)
+daily_report_sent_date: Optional[str] = None
 
+# --- UTILS ---
 def update_heartbeat() -> None:
     hb_path = config["monitoring"].get("heartbeat_file")
     if hb_path:
@@ -133,28 +135,22 @@ def is_quiet_hours() -> bool:
         logger.error(f"Error parsing quiet hours: {e}")
         return False
 
-def send_ntfy(title: str, message: str, priority: str = None, tags: str = None) -> None:
-    """
-    Send notification via ntfy.
-    """
+async def send_ntfy(title: str, message: str, priority: str = None, tags: str = None, actions: List[Dict] = None) -> None:
+    """Sends notification via ntfy using aiohttp."""
     ntfy_url = config["ntfy"]["url"]
     if not ntfy_url:
-        logger.error("NTFY_URL is not configured!")
+        logger.error("NTFY_URL not configured!")
         return
 
-    # Use defaults from config if not provided
     priority = priority or config["ntfy"]["priority"]
     tags = tags or config["ntfy"]["tags"]
 
-    # Quiet hours check: only send priority 5 if in quiet hours
     if is_quiet_hours() and int(priority) < 5:
-        logger.info(f"Quiet hours active. Suppressing notification: {title}")
+        logger.info(f"Quiet hours active. Suppressed: {title}")
         return
 
-    safe_title = title.encode('ascii', 'ignore').decode('ascii').strip()
-    clean_title = f"{safe_title} | {config['monitoring']['hostname']}"
-    clean_message = message.replace('\0', '').strip()
-
+    clean_title = f"{title} | {config['monitoring']['hostname']}"
+    
     headers = {
         "Title": clean_title,
         "Priority": str(priority),
@@ -163,223 +159,33 @@ def send_ntfy(title: str, message: str, priority: str = None, tags: str = None) 
 
     if config["ntfy"]["token"]:
         headers["Authorization"] = f"Bearer {config['ntfy']['token']}"
+    
+    if actions:
+        headers["Actions"] = json.dumps(actions)
 
     try:
-        # Message body is sent as raw UTF-8 bytes - this is safe for emojis
-        response = requests.post(
-            ntfy_url,
-            data=clean_message.encode('utf-8'),
-            headers=headers,
-            timeout=15
-        )
-        response.raise_for_status()
-        logger.info(f"Notification sent: {title}")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                ntfy_url,
+                data=message.encode('utf-8'),
+                headers=headers,
+                timeout=15
+            ) as response:
+                response.raise_for_status()
+                logger.info(f"Notification sent: {title}")
     except Exception as e:
         logger.error(f"Ntfy error: {e}")
 
-
-# --- DOCKER EVENT MONITORING ---
-def monitor_docker_events() -> None:
-    """
-    Real-time Docker event monitoring via Docker Socket.
-    """
-    socket_path = "/var/run/docker.sock"
-    if not os.path.exists(socket_path):
-        logger.warning(f"Docker socket not found at {socket_path}. Container monitoring disabled.")
-        return
-    
-    if not os.access(socket_path, os.R_OK | os.W_OK):
-        logger.error(f"Permission denied for Docker socket at {socket_path}. Check your user/group IDs.")
-        # We don't return here to allow the while loop to retry (maybe permissions change?)
-        # but we could also return if we want to stop early.
-
-    logger.info("Docker Event Monitor thread active.")
-    
-    # Build filter query based on config
-    actions = ["die", "start"]
-    if config["docker"].get("monitor_health"):
-        actions.append("health_status")
-    
-    # URL encode filters
-    filters = json.dumps({"type": ["container"], "action": actions})
-    from urllib.parse import quote
-    filter_query = quote(filters)
-
-    while True:
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-                s.connect(socket_path)
-                request = f"GET /events?filters={filter_query} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n"
-                s.send(request.encode())
-
-                with s.makefile('r', encoding='utf-8') as f:
-                    # Skip HTTP headers
-                    for line in f:
-                        if line == "\r\n": break
-                    
-                    for line in f:
-                        clean_line = line.replace('\0', '').strip()
-                        if not clean_line:
-                            continue
-                        try:
-                            # Docker events are often sent in chunks or as multiple JSONs
-                            # Simple approach: if it starts with { it might be our event
-                            if not clean_line.startswith('{'): continue
-                            
-                            event = json.loads(clean_line)
-                            action = event.get('action')
-                            actor = event.get('Actor', {})
-                            c_id = actor.get('ID', 'Unknown')
-                            attr = actor.get('Attributes', {})
-                            c_name = attr.get('name', 'Unknown')
-                            
-                            if action == "die":
-                                exit_code = attr.get('exitCode', '0')
-                                if exit_code != "0":
-                                    msg = f"Container '{c_name}' crashed (Exit Code: {exit_code})"
-                                    logger.warning(msg)
-                                    send_ntfy("CONTAINER CRASHED", msg, "5", "skull,warning")
-                                    
-                                    if config["docker"].get("auto_restart"):
-                                        logger.info(f"Attempting to restart container: {c_name}")
-                                        restart_container(c_id)
-                                else:
-                                    msg = f"Container '{c_name}' stopped gracefully"
-                                    logger.info(msg)
-                                    send_ntfy("CONTAINER STOPPED", msg, "3", "stop_button")
-                            elif action == "start":
-                                msg = f"Container '{c_name}' started"
-                                logger.info(msg)
-                                send_ntfy("CONTAINER STARTED", msg, "3", "rocket")
-                            elif action.startswith("health_status"):
-                                status = action.split(":")[-1].strip()
-                                if status == "unhealthy":
-                                    msg = f"Container '{c_name}' is UNHEALTHY"
-                                    logger.warning(msg)
-                                    send_ntfy("CONTAINER UNHEALTHY", msg, "4", "medical_symbol,warning")
-                        except (json.JSONDecodeError, ValueError):
-                            continue
-        except Exception as e:
-            logger.error(f"Docker socket connection error: {e}")
-            time.sleep(10)
-
-
-def restart_container(container_id: str) -> None:
-    """
-    Attempts to restart a container via Docker Socket.
-    """
-    socket_path = "/var/run/docker.sock"
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.connect(socket_path)
-            request = f"POST /containers/{container_id}/restart HTTP/1.1\r\nHost: docker\r\nContent-Length: 0\r\n\r\n"
-            s.send(request.encode())
-            response = s.recv(4096).decode()
-            if "204 No Content" in response or "200 OK" in response:
-                logger.info(f"Container {container_id} restart command sent successfully.")
-            else:
-                logger.error(f"Failed to restart container {container_id}: {response}")
-    except Exception as e:
-        logger.error(f"Error restarting container {container_id}: {e}")
-
-
-# --- SYSTEM STATISTICS ---
-def get_disks_usage() -> Dict[str, float]:
-    """
-    Retrieves disk usage for physical devices.
-    Filters out virtual filesystems related to Docker and the system.
-    """
-    global current_disk_stats, current_inode_stats
-    disks: Dict[str, float] = {}
-    inodes: Dict[str, float] = {}
-    try:
-        if not os.path.exists("/proc/mounts"):
-            return disks
-
-        with open("/proc/mounts", "r") as f:
-            for line in f:
-                parts = line.split()
-                # Monitor only physical/mapped drives
-                if len(parts) >= 2 and parts[0].startswith(('/dev/sd', '/dev/nvme', '/dev/mapper')):
-                    mount = parts[1]
-                    # Filter out Docker/K8s specific mount points
-                    if mount not in disks and not any(x in mount for x in ['docker', 'overlay', 'kubelet', 'containers']):
-                        try:
-                            st = os.statvfs(mount)
-                            if st.f_blocks > 0:
-                                usage = round((1 - (st.f_bavail / st.f_blocks)) * 100, 1)
-                                disks[mount] = usage
-                            if st.f_files > 0:
-                                i_usage = round((1 - (st.f_favail / st.f_files)) * 100, 1)
-                                inodes[mount] = i_usage
-                        except OSError:
-                            continue
-        current_disk_stats = disks
-        current_inode_stats = inodes
-        logger.info(f"Disk check completed. Disks: {disks}, Inodes: {inodes}")
-    except Exception as e:
-        logger.error(f"Disk scanning error: {e}")
-    return disks
-
-
-def get_network_usage() -> Optional[float]:
-    """
-    Calculates average network throughput in Mbps.
-    """
-    global last_net_bytes
-    try:
-        if not os.path.exists("/proc/net/dev"):
-            return None
-        
-        current_time = time.time()
-        total_bytes = 0
-        with open("/proc/net/dev", "r") as f:
-            lines = f.readlines()[2:] # Skip headers
-            for line in lines:
-                parts = line.split()
-                if len(parts) > 8:
-                    iface = parts[0].strip(':')
-                    if iface == 'lo': continue
-                    # receive bytes + transmit bytes
-                    total_bytes += int(parts[1]) + int(parts[9])
-        
-        if not last_net_bytes:
-            last_net_bytes["total"] = (current_time, total_bytes)
-            return 0.0
-        
-        last_time, last_total = last_net_bytes["total"]
-        time_diff = current_time - last_time
-        if time_diff <= 0: return 0.0
-        
-        byte_diff = total_bytes - last_total
-        if byte_diff < 0: # Counter reset
-            last_net_bytes["total"] = (current_time, total_bytes)
-            return 0.0
-        
-        mbps = (byte_diff * 8) / (1024 * 1024) / time_diff
-        last_net_bytes["total"] = (current_time, total_bytes)
-        return round(mbps, 2)
-    except Exception as e:
-        logger.debug(f"Network stats error: {e}")
-        return None
-
-
+# --- SYSTEM STATS ---
 def get_cpu_usage() -> Optional[float]:
-    """
-    Calculates CPU usage percentage from /proc/stat.
-    """
     global last_cpu_times
     try:
-        if not os.path.exists("/proc/stat"):
-            return None
+        if not os.path.exists("/proc/stat"): return None
         with open("/proc/stat", "r") as f:
             line = f.readline()
-        
         parts = line.split()
         if len(parts) < 5: return None
         
-        # cpu  user nice system idle iowait irq softirq steal guest guest_nice
-        # 0    1    2    3      4    5      6   7       8     9     10
         idle = int(parts[4]) + int(parts[5])
         total = sum(int(p) for p in parts[1:11])
         
@@ -390,317 +196,402 @@ def get_cpu_usage() -> Optional[float]:
         last_idle, last_total = last_cpu_times
         idle_diff = idle - last_idle
         total_diff = total - last_total
-        
         last_cpu_times = (idle, total)
         
         if total_diff <= 0: return 0.0
         return round(100 * (1 - idle_diff / total_diff), 1)
-    except Exception as e:
-        logger.debug(f"CPU usage error: {e}")
+    except Exception:
         return None
 
-def get_system_stats() -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
-    """
-    Retrieves CPU temp, cpu %, ram %, swap %, load, net, uptime.
-    
-    Returns:
-        Tuple: (temp, cpu_usage, ram, swap, load, net, uptime)
-    """
-    temp, cpu_usage, ram, swap, load, net, uptime = None, None, None, None, None, None, None
-    
-    # CPU usage
-    cpu_usage = get_cpu_usage()
-
-    # CPU Temperature
+def get_network_usage() -> Optional[float]:
+    global last_net_bytes
     try:
-        # Try standard hwmon paths
-        temp_found = False
-        for i in range(10):
+        if not os.path.exists("/proc/net/dev"): return None
+        current_time = time.time()
+        total_bytes = 0
+        with open("/proc/net/dev", "r") as f:
+            lines = f.readlines()[2:]
+            for line in lines:
+                parts = line.split()
+                if len(parts) > 8:
+                    if parts[0].strip(':') == 'lo': continue
+                    total_bytes += int(parts[1]) + int(parts[9])
+        
+        if "total" not in last_net_bytes:
+            last_net_bytes["total"] = (current_time, total_bytes)
+            return 0.0
+        
+        last_time, last_total = last_net_bytes["total"]
+        time_diff = current_time - last_time
+        if time_diff <= 0: return 0.0
+        
+        byte_diff = total_bytes - last_total
+        last_net_bytes["total"] = (current_time, total_bytes)
+        if byte_diff < 0: return 0.0
+        
+        mbps = (byte_diff * 8) / (1024 * 1024) / time_diff
+        return round(mbps, 2)
+    except Exception:
+        return None
+
+def get_system_stats() -> Dict[str, Any]:
+    stats = {
+        "temp": None, "cpu": get_cpu_usage(), "ram": None, 
+        "swap": None, "load": None, "net": get_network_usage(), "uptime": None
+    }
+    
+    # Temp
+    try:
+        for i in range(5):
             path = f"/sys/class/hwmon/hwmon{i}/temp1_input"
             if os.path.exists(path):
                 with open(path, "r") as f:
-                    temp = int(f.read()) / 1000
-                    temp_found = True
+                    stats["temp"] = int(f.read()) / 1000
                     break
-        if not temp_found and os.path.exists("/sys/class/thermal/thermal_zone0/temp"):
+        if stats["temp"] is None and os.path.exists("/sys/class/thermal/thermal_zone0/temp"):
             with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
-                temp = int(f.read()) / 1000
-    except Exception as e:
-        logger.debug(f"Could not read temperature: {e}")
+                stats["temp"] = int(f.read()) / 1000
+    except Exception: pass
 
-    # RAM & Swap Usage
+    # RAM / Swap
     try:
         with open('/proc/meminfo', 'r') as f:
             m = {l.split(':')[0]: l.split(':')[1].strip() for l in f}
         if 'MemTotal' in m and 'MemAvailable' in m:
             total = int(m['MemTotal'].split()[0])
             available = int(m['MemAvailable'].split()[0])
-            ram = round((1 - (available / total)) * 100, 1)
-        
-        if 'SwapTotal' in m and 'SwapFree' in m:
+            stats["ram"] = round((1 - (available / total)) * 100, 1)
+        if 'SwapTotal' in m and 'SwapFree' in m and int(m['SwapTotal'].split()[0]) > 0:
             s_total = int(m['SwapTotal'].split()[0])
             s_free = int(m['SwapFree'].split()[0])
-            if s_total > 0:
-                swap = round((1 - (s_free / s_total)) * 100, 1)
-    except Exception as e:
-        logger.debug(f"Could not read RAM/Swap info: {e}")
+            stats["swap"] = round((1 - (s_free / s_total)) * 100, 1)
+    except Exception: pass
 
-    # Load Average
+    # Load / Uptime
     try:
-        load = os.getloadavg()[0]
-    except Exception:
-        pass
-
-    # Uptime
-    try:
+        stats["load"] = os.getloadavg()[0]
         if os.path.exists("/proc/uptime"):
             with open("/proc/uptime", "r") as f:
-                uptime = float(f.read().split()[0])
-    except Exception:
-        pass
+                stats["uptime"] = float(f.read().split()[0])
+    except Exception: pass
 
-    net = get_network_usage()
+    return stats
 
-    return temp, cpu_usage, ram, swap, load, net, uptime
-
-
-def get_container_stats() -> List[str]:
-    """
-    Fetches CPU and RAM usage for all running containers.
-    """
-    socket_path = "/var/run/docker.sock"
-    if not os.path.exists(socket_path):
-        return []
-    
-    stats_list = []
+async def check_disks():
+    global current_disk_stats, current_inode_stats
+    disks, inodes = {}, {}
     try:
-        # 1. Get running container IDs
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.connect(socket_path)
-            s.send(b"GET /containers/json HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n")
-            response = b""
-            while True:
-                data = s.recv(4096)
-                if not data: break
-                response += data
-            
-            # Simple HTTP response parsing
-            body = response.split(b"\r\n\r\n")[1]
-            containers = json.loads(body)
-            
-            for c in containers:
-                c_id = c['Id']
-                c_name = c['Names'][0].strip('/')
-                
-                # 2. Get stats for each container (one-shot)
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s2:
-                    s2.connect(socket_path)
-                    s2.send(f"GET /containers/{c_id}/stats?stream=false HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n".encode())
-                    resp2 = b""
-                    while True:
-                        data = s2.recv(4096)
-                        if not data: break
-                        resp2 += data
-                    
-                    try:
-                        body2 = resp2.split(b"\r\n\r\n")[1]
-                        stat_data = json.loads(body2)
-                        
-                        # RAM Usage
-                        mem_usage = stat_data.get('memory_stats', {}).get('usage', 0)
-                        mem_limit = stat_data.get('memory_stats', {}).get('limit', 1)
-                        mem_pct = round((mem_usage / mem_limit) * 100, 1) if mem_limit > 0 else 0
-                        
-                        # CPU Usage (simplified)
-                        cpu_delta = stat_data.get('cpu_stats', {}).get('cpu_usage', {}).get('total_usage', 0) - \
-                                    stat_data.get('precpu_stats', {}).get('cpu_usage', {}).get('total_usage', 0)
-                        sys_delta = stat_data.get('cpu_stats', {}).get('system_cpu_usage', 0) - \
-                                    stat_data.get('precpu_stats', {}).get('system_cpu_usage', 0)
-                        num_cpus = stat_data.get('cpu_stats', {}).get('online_cpus', 1)
-                        
-                        cpu_pct = 0.0
-                        if sys_delta > 0 and cpu_delta > 0:
-                            cpu_pct = round((cpu_delta / sys_delta) * num_cpus * 100, 1)
-                        
-                        stats_list.append(f"- {c_name}: CPU: {cpu_pct}%, RAM: {mem_pct}%")
-                    except Exception:
-                        continue
+        with open("/proc/mounts", "r") as f:
+            for line in f:
+                p = line.split()
+                if len(p) >= 2 and p[0].startswith(('/dev/sd', '/dev/nvme', '/dev/mapper')):
+                    mount = p[1]
+                    if not any(x in mount for x in ['docker', 'overlay', 'kubelet', 'containers']):
+                        try:
+                            st = os.statvfs(mount)
+                            if st.f_blocks > 0:
+                                disks[mount] = round((1 - (st.f_bavail / st.f_blocks)) * 100, 1)
+                            if st.f_files > 0:
+                                inodes[mount] = round((1 - (st.f_favail / st.f_files)) * 100, 1)
+                        except OSError: continue
+        current_disk_stats, current_inode_stats = disks, inodes
+        
+        issues = []
+        limits = config["limits"]
+        d_warn = limits["disk"].get("warning", 85)
+        d_crit = limits["disk"].get("critical", 95)
+        i_limit = limits.get("inode", 90)
+
+        for path, used in disks.items():
+            if used >= d_crit:
+                issues.append(f"CRITICAL: Low space on {path}: {used}%")
+            elif used >= d_warn:
+                issues.append(f"WARNING: Low space on {path}: {used}%")
+        
+        for path, used in inodes.items():
+            if used >= i_limit:
+                issues.append(f"Low Inodes on {path}: {used}%")
+        
+        if issues:
+            priority = "5" if any("CRITICAL" in i for i in issues) else "4"
+            await send_ntfy("STORAGE ALERT", "\n".join(issues), priority, "floppy_disk,warning")
     except Exception as e:
-        logger.debug(f"Error fetching container stats: {e}")
-    
-    return stats_list
+        logger.error(f"Disk check error: {e}")
 
-def check_critical_fast() -> None:
-    """
-    Quick check for critical values (Temperature, RAM, Network).
-    """
-    update_heartbeat()
-    temp, cpu_usage, ram, swap, load, net, uptime = get_system_stats()
-    issues: List[str] = []
-    
-    if temp is not None and temp >= config["limits"]["temp"]:
-        issues.append(f"CPU Overheat: {temp}C")
-    if ram is not None and ram >= config["limits"]["ram"]:
-        issues.append(f"High RAM Usage: {ram}%")
-    if swap is not None and swap >= config["limits"]["swap"]:
-        issues.append(f"High Swap Usage: {swap}%")
-    if net is not None and net >= config["limits"]["net_mbps"]:
-        issues.append(f"High Network Load: {net} Mbps")
-
-    if issues:
-        send_ntfy("CRITICAL ALERT", "\n".join(issues), "5", "fire,warning")
-    else:
-        stats_str = []
-        if temp is not None: stats_str.append(f"T: {temp}C")
-        if cpu_usage is not None: stats_str.append(f"CPU: {cpu_usage}%")
-        if ram is not None: stats_str.append(f"RAM: {ram}%")
-        if load is not None: stats_str.append(f"L: {load:.2f}")
-        if net is not None: stats_str.append(f"N: {net} Mbps")
-        logger.info(f"Health OK: {' | '.join(stats_str)}")
-
-
-def check_critical_disks() -> None:
-    """
-    Checks disk usage based on the specified threshold.
-    """
-    get_disks_usage()
-    issues: List[str] = []
-    for path, used in current_disk_stats.items():
-        if used >= config["limits"]["disk"]:
-            issues.append(f"Low Space on {path}: {used}%")
-    
-    for path, used in current_inode_stats.items():
-        if used >= config["limits"]["inode"]:
-            issues.append(f"Low Inodes on {path}: {used}%")
-    
-    if issues:
-        send_ntfy("STORAGE ALERT", "\n".join(issues), "4", "floppy_disk,warning")
-
-
-def send_report(report_type: str = "Daily") -> None:
-    """
-    Sends a summary status report.
-    """
-    temp, cpu_usage, ram, swap, load, net, uptime = get_system_stats()
-    
-    report_lines = [f"Status: Operational"]
-    
-    # OS Info
+# --- DOCKER ---
+async def docker_api_call(method: str, path: str) -> Optional[Any]:
+    socket_path = "/var/run/docker.sock"
+    if not os.path.exists(socket_path): return None
     try:
-        uname = os.uname()
-        report_lines.append(f"OS: {uname.sysname} {uname.release}")
-    except Exception:
-        pass
+        reader, writer = await asyncio.open_unix_connection(socket_path)
+        request = f"{method} {path} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n"
+        writer.write(request.encode())
+        await writer.drain()
+        
+        response = b""
+        while True:
+            data = await reader.read(4096)
+            if not data: break
+            response += data
+        writer.close()
+        await writer.wait_closed()
+        
+        parts = response.split(b"\r\n\r\n", 1)
+        if len(parts) < 2: return None
+        try:
+            return json.loads(parts[1])
+        except json.JSONDecodeError:
+            return parts[1].decode('utf-8', errors='ignore')
+    except Exception as e:
+        logger.debug(f"Docker API error ({path}): {e}")
+        return None
 
-    if uptime is not None:
-        days = int(uptime // 86400)
-        hours = int((uptime % 86400) // 3600)
-        report_lines.append(f"Uptime: {days}d {hours}h")
-
-    if temp is not None:
-        report_lines.append(f"CPU Temp: {temp}C")
-    if cpu_usage is not None:
-        report_lines.append(f"CPU Usage: {cpu_usage}%")
-    if load is not None:
-        report_lines.append(f"Load (1m): {load:.2f}")
-    if ram is not None:
-        report_lines.append(f"RAM: {ram}%")
-    if swap is not None:
-        report_lines.append(f"Swap: {swap}%")
-    if net is not None:
-        report_lines.append(f"Network: {net} Mbps")
+async def get_container_stats() -> List[str]:
+    containers = await docker_api_call("GET", "/containers/json")
+    if not isinstance(containers, list): return []
     
-    # Disks
-    disk_lines = []
-    for path, used in current_disk_stats.items():
-        i_used = current_inode_stats.get(path, 0)
-        disk_lines.append(f"- {path}: {used}% (Inodes: {i_used}%)")
+    results = []
+    for c in containers:
+        c_name = c['Names'][0].strip('/')
+        stats = await docker_api_call("GET", f"/containers/{c['Id']}/stats?stream=false")
+        if isinstance(stats, dict):
+            mem_u = stats.get('memory_stats', {}).get('usage', 0)
+            mem_l = stats.get('memory_stats', {}).get('limit', 1)
+            mem_p = round((mem_u / mem_l) * 100, 1) if mem_l > 0 else 0
+            
+            c_delta = stats.get('cpu_stats', {}).get('cpu_usage', {}).get('total_usage', 0) - \
+                      stats.get('precpu_stats', {}).get('cpu_usage', {}).get('total_usage', 0)
+            s_delta = stats.get('cpu_stats', {}).get('system_cpu_usage', 0) - \
+                      stats.get('precpu_stats', {}).get('system_cpu_usage', 0)
+            cpus = stats.get('cpu_stats', {}).get('online_cpus', 1)
+            cpu_p = round((c_delta / s_delta) * cpus * 100, 1) if s_delta > 0 else 0
+            results.append(f"- {c_name}: CPU: {cpu_p}%, RAM: {mem_p}%")
+    return results
+
+async def monitor_docker_events():
+    socket_path = "/var/run/docker.sock"
+    if not os.path.exists(socket_path): return
     
-    if disk_lines:
-        report_lines.append(f"\nDisks:\n" + "\n".join(disk_lines))
+    actions = ["die", "start"]
+    if config["docker"].get("monitor_health"): actions.append("health_status")
+    filters = json.dumps({"type": ["container"], "action": actions})
+    from urllib.parse import quote
     
-    # Containers
-    c_stats = get_container_stats()
-    if c_stats:
-        report_lines.append(f"\nContainers:\n" + "\n".join(c_stats))
+    while True:
+        try:
+            reader, writer = await asyncio.open_unix_connection(socket_path)
+            request = f"GET /events?filters={quote(filters)} HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n"
+            writer.write(request.encode())
+            await writer.drain()
+            
+            while True:
+                line = await reader.readline()
+                if not line: break
+                clean = line.decode().strip()
+                if not clean.startswith('{'): continue
+                
+                event = json.loads(clean)
+                action = event.get('action')
+                attr = event.get('Actor', {}).get('Attributes', {})
+                c_name = attr.get('name', 'Unknown')
+                
+                if action == "die":
+                    exit_code = attr.get('exitCode', '0')
+                    if exit_code != "0":
+                        msg = f"Container '{c_name}' crashed (Exit Code: {exit_code})"
+                        await send_ntfy("CONTAINER CRASHED", msg, "5", "skull,warning")
+                        if config["docker"].get("auto_restart"):
+                            await docker_api_call("POST", f"/containers/{event['Actor']['ID']}/restart")
+                    else:
+                        await send_ntfy("CONTAINER STOPPED", f"Container '{c_name}' stopped gracefully", "3", "stop_button")
+                elif action == "start":
+                    await send_ntfy("CONTAINER STARTED", f"Container '{c_name}' started", "3", "rocket")
+                elif "health_status" in action and "unhealthy" in action:
+                    await send_ntfy("CONTAINER UNHEALTHY", f"Container '{c_name}' is UNHEALTHY", "4", "medical_symbol,warning")
+        except Exception as e:
+            logger.error(f"Docker Event Socket error: {e}")
+            await asyncio.sleep(10)
 
-    summary = "\n".join(report_lines)
-    send_report_title = f"{report_type} Status"
-    send_ntfy(send_report_title, summary, "3", "calendar")
+# --- SERVICES & SSL ---
+async def check_services():
+    async with aiohttp.ClientSession() as session:
+        for svc in config.get("services", []):
+            name = svc.get("name", "Unknown Service")
+            url = svc.get("url")
+            expected = svc.get("expected_status", 200)
+            
+            try:
+                async with session.get(url, timeout=10) as resp:
+                    if resp.status != expected:
+                        await send_ntfy("SERVICE DOWN", f"{name} returned status {resp.status} (expected {expected})", "5", "cloud_drain,warning")
+                
+                if svc.get("check_ssl") and url.startswith("https"):
+                    await check_ssl_expiry(name, url, svc.get("ssl_days_before", 7))
+            except Exception as e:
+                await send_ntfy("SERVICE ERROR", f"{name} is unreachable: {e}", "5", "cloud_drain,warning")
 
+async def check_ssl_expiry(name: str, url: str, days_limit: int):
+    try:
+        hostname = url.split("//")[-1].split("/")[0]
+        context = ssl.create_default_context()
+        with socket.create_connection((hostname, 443), timeout=5) as sock:
+            with context.wrap_socket(sock, server_hostname=hostname) as ssock:
+                cert_bin = ssock.getpeercert(True)
+                cert = x509.load_der_x509_certificate(cert_bin, default_backend())
+                remaining = cert.not_valid_after_utc - datetime.now(timedelta(0))
+                if remaining.days < days_limit:
+                    await send_ntfy("SSL EXPIRY", f"Certificate for {name} ({hostname}) expires in {remaining.days} days!", "4", "lock,warning")
+    except Exception as e:
+        logger.error(f"SSL check error for {name}: {e}")
 
-def monitor_logs() -> None:
-    """
-    Monitors log files for critical keywords.
-    """
-    watch_files = config["logs"].get("watch_files", [])
-    if not watch_files:
+# --- BACKUPS ---
+async def check_backups():
+    for b in config.get("backups", []):
+        name = b.get("name")
+        path = b.get("path")
+        max_age = b.get("max_age_hours", 24)
+        
+        if not os.path.exists(path):
+            await send_ntfy("BACKUP MISSING", f"Backup file not found for {name} at {path}", "5", "card_file_box,warning")
+            continue
+        
+        mtime = os.path.getmtime(path)
+        age_hours = (time.time() - mtime) / 3600
+        if age_hours > max_age:
+            await send_ntfy("BACKUP STALE", f"Backup for {name} is {age_hours:.1f} hours old (limit: {max_age})", "5", "card_file_box,warning")
+
+# --- LOGS ---
+async def tail_log(file_cfg: Dict):
+    path = file_cfg.get("path")
+    patterns = file_cfg.get("patterns", [])
+    if not os.path.exists(path):
+        logger.warning(f"Log not found: {path}")
         return
 
-    logger.info(f"Log Monitor active for files: {watch_files}")
-    
-    threads = []
-    for file_path in watch_files:
-        t = threading.Thread(target=tail_file, args=(file_path,), daemon=True)
-        t.start()
-        threads.append(t)
-
-
-def tail_file(file_path: str) -> None:
-    """
-    Simple tail -f implementation to watch for keywords.
-    """
-    if not os.path.exists(file_path):
-        logger.warning(f"Log file not found: {file_path}")
-        return
-
     try:
-        with open(file_path, 'r') as f:
-            # Go to end of file
+        with open(path, 'r') as f:
             f.seek(0, 2)
             while True:
                 line = f.readline()
                 if not line:
-                    time.sleep(1)
+                    await asyncio.sleep(1)
                     continue
                 
-                # Check for keywords
-                upper_line = line.upper()
-                if "ERROR" in upper_line or "FATAL" in upper_line or "CRITICAL" in upper_line:
-                    msg = f"Found in {file_path}: {line.strip()}"
-                    logger.warning(f"Log Alert: {msg}")
-                    send_ntfy("LOG ALERT", msg, "4", "mag_right,warning")
+                for p in patterns:
+                    if re.search(p.get("regex", ""), line):
+                        await send_ntfy(
+                            f"LOG: {p.get('name', 'Pattern Match')}",
+                            f"File: {path}\nMatch: {line.strip()}",
+                            p.get("priority", "4"),
+                            p.get("tags", "mag_right")
+                        )
     except Exception as e:
-        logger.error(f"Error watching log file {file_path}: {e}")
+        logger.error(f"Error tailing {path}: {e}")
 
+# --- MAIN LOGIC ---
+async def check_critical():
+    update_heartbeat()
+    stats = get_system_stats()
+    issues = []
+    limits = config["limits"]
 
-# --- MAIN LOOP ---
-if __name__ == "__main__":
-    mon_cfg = config["monitoring"]
-    logger.info(f"--- Server Monitor Starting on {mon_cfg['hostname']} ---")
+    # Threshold checks
+    t = stats["temp"]
+    if t:
+        if t >= limits["temp"].get("critical", 85): issues.append(f"CRITICAL: CPU Temp {t}C")
+        elif t >= limits["temp"].get("warning", 75): issues.append(f"WARNING: CPU Temp {t}C")
     
-    # Initialize disk stats
-    get_disks_usage()
+    r = stats["ram"]
+    if r:
+        if r >= limits["ram"].get("critical", 90): issues.append(f"CRITICAL: RAM Usage {r}%")
+        elif r >= limits["ram"].get("warning", 80): issues.append(f"WARNING: RAM Usage {r}%")
+    
+    s = stats["swap"]
+    if s and s >= limits.get("swap", 80): issues.append(f"High Swap: {s}%")
+    
+    n = stats["net"]
+    if n and n >= limits.get("net_mbps", 100): issues.append(f"High Network: {n} Mbps")
 
-    # Start Docker monitor on background thread
-    docker_thread = threading.Thread(target=monitor_docker_events, daemon=True)
-    docker_thread.start()
+    if issues:
+        priority = "5" if any("CRITICAL" in i for i in issues) else "4"
+        await send_ntfy("SYSTEM ALERT", "\n".join(issues), priority, "fire,warning")
+    else:
+        logger.info(f"Health OK: T:{stats['temp']}C | CPU:{stats['cpu']}% | RAM:{stats['ram']}% | Net:{stats['net']}Mbps")
 
-    # Start Log monitor
-    monitor_logs()
+async def send_report(report_type: str = "Daily"):
+    stats = get_system_stats()
+    lines = [f"Status: Operational"]
+    try:
+        u = os.uname()
+        lines.append(f"OS: {u.sysname} {u.release}")
+    except: pass
 
-    # Setup scheduling
-    schedule.every().day.at(mon_cfg["daily_time"]).do(send_report, report_type="Daily")
-    schedule.every().monday.at(mon_cfg["daily_time"]).do(send_report, report_type="Weekly")
-    schedule.every().hour.do(check_critical_disks)
+    if stats["uptime"]:
+        d, h = int(stats["uptime"] // 86400), int((stats["uptime"] % 86400) // 3600)
+        lines.append(f"Uptime: {d}d {h}h")
 
-    interval = mon_cfg["check_interval"]
-    logger.info(f"Monitoring started. Interval: {interval}s")
+    for k in ["temp", "cpu", "ram", "swap", "net"]:
+        if stats[k] is not None:
+            unit = "C" if k=="temp" else "%" if k in ["cpu","ram","swap"] else " Mbps"
+            lines.append(f"{k.capitalize()}: {stats[k]}{unit}")
+    
+    if current_disk_stats:
+        lines.append("\nDisks:")
+        for p, u in current_disk_stats.items():
+            lines.append(f"- {p}: {u}% (I: {current_inode_stats.get(p,0)}%)")
+    
+    c_stats = await get_container_stats()
+    if c_stats:
+        lines.append("\nContainers:")
+        lines.extend(c_stats)
 
+    actions = [{"action": "view", "label": "Web Interface", "url": f"http://{config['monitoring']['hostname']}", "clear": True}]
+    await send_ntfy(f"{report_type} Status", "\n".join(lines), "3", "calendar", actions=actions)
+
+async def main():
+    global daily_report_sent_date
+    logger.info(f"--- Server Monitor Starting on {config['monitoring']['hostname']} ---")
+    
+    await check_disks()
+    
+    # Background tasks
+    asyncio.create_task(monitor_docker_events())
+    for log_cfg in config["logs"].get("watch_files", []):
+        asyncio.create_task(tail_log(log_cfg))
+
+    last_disk_check = 0
+    last_service_check = 0
+    
     while True:
         try:
-            check_critical_fast()
-            schedule.run_pending()
+            now = datetime.now()
+            # 1. Critical stats
+            await check_critical()
+            
+            # 2. Daily report
+            report_time = config["monitoring"]["daily_time"]
+            today = now.strftime("%Y-%m-%d")
+            if now.strftime("%H:%M") == report_time and daily_report_sent_date != today:
+                await send_report("Daily")
+                daily_report_sent_date = today
+            
+            # 3. Periodical checks
+            if time.time() - last_disk_check > 3600:
+                await check_disks()
+                await check_backups()
+                last_disk_check = time.time()
+            
+            if time.time() - last_service_check > 300: # Every 5 mins
+                await check_services()
+                last_service_check = time.time()
+
         except Exception as e:
-            logger.critical(f"Error in main loop: {e}")
-        time.sleep(interval)
+            logger.critical(f"Main loop error: {e}")
+        
+        await asyncio.sleep(config["monitoring"]["check_interval"])
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

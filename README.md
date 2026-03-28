@@ -4,48 +4,37 @@
 [![Docker Image Size](https://img.shields.io/docker/image-size/nurefexc/server-monitoring-ntfy/latest)](https://hub.docker.com/r/nurefexc/server-monitoring-ntfy)
 [![Docker Image Version](https://img.shields.io/docker/v/nurefexc/server-monitoring-ntfy/latest)](https://hub.docker.com/r/nurefexc/server-monitoring-ntfy)
 
-A lightweight Python script that monitors system resources and Docker containers, sending real-time alerts and scheduled reports to your [ntfy](https://ntfy.sh) topic.
+A lightweight Python script that monitors system resources, Docker containers, external services, and logs, sending real-time alerts and scheduled reports to your [ntfy](https://ntfy.sh) topic.
 
 ## Features
 
-- **System Resource Monitoring:** Tracks CPU temperature, RAM usage, and Disk space with customizable thresholds.
-- **Docker Event Monitoring:** Instant notifications when a container stops unexpectedly (detects non-zero exit codes via Docker socket).
-- **Scheduled Reports:** Automatically sends Daily and Weekly status summaries to keep you informed.
-- **Priority-Based Alerts:** Uses ntfy priorities (1-5) and tags (emojis) to distinguish between critical issues and routine updates.
-- **Docker Ready:** Optimized for containerized deployment with minimal footprint.
+- **System Resource Monitoring:** Tracks CPU temperature, RAM, CPU %, and Disk space with dynamic thresholds (Warning/Critical).
+- **Docker Event Monitoring:** Instant notifications when a container stops unexpectedly or becomes unhealthy.
+- **External Service Checks:** Monitors URLs for availability and expected HTTP status codes.
+- **SSL Certificate Monitoring:** Alerts before your SSL certificates expire.
+- **SSH & Log Monitoring:** Uses Regex to watch log files for SSH logins or specific error patterns.
+- **Backup Verification:** Ensures your backup files are present and up-to-date.
+- **Scheduled Reports:** Automatically sends Daily status summaries.
+- **Quiet Hours:** Suppresses non-critical notifications during specified hours.
+- **Self-Healing:** Can automatically restart crashed Docker containers.
+- **Async Implementation:** Modern `asyncio` base for high performance and low resource usage.
 
-## Prerequisites
+## Usage with Docker Compose (Recommended)
 
-1. **ntfy Topic:** Create a topic on [ntfy.sh](https://ntfy.sh) (e.g., `my_server_monitor`).
-2. **Docker Socket (Optional):** To monitor container crashes, the script needs access to `/var/run/docker.sock`.
-
-- **Öngyógyítás (Self-Healing):** Automatikus konténer újraindítás, ha hibával áll le.
-- **Részletes Adatgyűjtés:** CPU használat, Swap memória, Uptime, OS információk és Inode használat figyelése.
-- **Docker Statisztikák:** Futó konténerek CPU és RAM használatának listázása a jelentésekben.
-- **Hálózati monitorozás:** Figyeli a forgalmat (Mbps) és riaszt, ha túl magas.
-- **Log figyelés:** Képes log fájlokban keresni kritikus hibákat (ERROR, FATAL).
-- **Csendes mód (Quiet Hours):** Éjszaka csak a kritikus riasztások jönnek meg.
-- **Docker Healthcheck:** Beépített öndiagnosztika a konténer állapotának figyeléséhez.
-- **YAML konfiguráció:** Könnyen kezelhető beállítások fájlból.
-
-## Használat Docker Compose-al (Ajánlott)
-
-A legkényelmesebb futtatási mód a Docker Compose használata.
-
-1. Másold le a `docker-compose.yml` fájlt.
-2. Hozz létre egy `config.yaml` fájlt a `config.yaml.example` alapján.
-3. Indítsd el:
+1. Copy the `docker-compose.yml` file.
+2. Create a `config.yaml` based on `config.yaml.example`.
+3. Start the monitor:
    ```bash
    docker-compose up -d
    ```
 
-### Megjegyzés a jogosultságokról
-A Docker socket (`/var/run/docker.sock`) eléréséhez a konténernek megfelelő jogosultságokkal kell rendelkeznie. Ha `[Errno 13] Permission denied` hibát látsz a logokban:
-1. Ellenőrizd a host gépen a docker csoport GID-jét: `getent group docker | cut -d: -f3`
-2. Állítsd be a `docker-compose.yml`-ben a `user` mezőt (pl. `user: "1000:999"`, ahol 999 a kapott GID).
-3. Vagy futtasd a konténert rootként: `user: "root"` (kevésbé biztonságos).
+### Permission Notes
+To access the Docker socket (`/var/run/docker.sock`), the container needs proper permissions. If you see `[Errno 13] Permission denied` in logs:
+1. Check the docker group GID on the host: `getent group docker | cut -d: -f3`
+2. Set the `user` field in `docker-compose.yml` (e.g., `user: "1000:999"`, where 999 is the GID).
+3. Alternatively, run as root: `user: "root"` (less secure but easiest).
 
-### docker-compose.yml példa:
+### docker-compose.yml example:
 ```yaml
 services:
   monitoring:
@@ -56,47 +45,34 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - /proc:/proc:ro
       - /sys:/sys:ro
+      - /var/log:/var/log:ro
       - ./config.yaml:/app/config.yaml:ro
     environment:
-      - TZ=Europe/Budapest
+      - TZ=UTC
       - CONFIG_PATH=/app/config.yaml
 ```
 
-## Konfiguráció (YAML)
+## Configuration (YAML)
 
-A `config.yaml` fájlban minden paraméter finomhangolható:
+Everything is configurable in `config.yaml`. See `config.yaml.example` for a full list of options including log patterns and service checks.
 
-| Szakasz | Paraméter | Leírás | Alapértelmezett |
+| Section | Parameter | Description | Default |
 |---------|-----------|--------|-----------------|
 | `ntfy` | `url` | ntfy topic URL | - |
-| `limits` | `temp` | CPU hőmérséklet limit (°C) | `82` |
-| `limits` | `ram` | RAM használat limit (%) | `92` |
-| `limits` | `net_mbps` | Hálózati forgalom limit (Mbps) | `100` |
-| `monitoring` | `quiet_hours` | Csendes időszak (pl. "23:00-06:00") | `null` |
-| `docker` | `auto_restart` | Automatikus újraindítás | `false` |
-
-## Környezeti változók
-A visszamenőleges kompatibilitás érdekében az alábbi környezeti változók is használhatóak:
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `NTFY_URL` | Full ntfy topic URL (required) | - |
-| `NTFY_TOKEN` | ntfy authentication token (optional) | - |
-| `HOSTNAME` | Server name shown in notifications | *System Hostname* |
-| `TEMP_LIMIT` | CPU temperature alert threshold (°C) | `82` |
-| `DISK_LIMIT` | Disk usage alert threshold (%) | `90` |
-| `RAM_LIMIT` | RAM usage alert threshold (%) | `92` |
-| `DAILY_TIME` | Time for scheduled reports (HH:MM) | `08:00` |
-| `CHECK_INTERVAL`| Polling frequency in seconds | `60` |
-| `TZ` | System timezone (e.g., `Europe/Budapest`) | `UTC` |
+| `limits` | `temp` | CPU temperature limits | `75/85` |
+| `limits` | `ram` | RAM usage limits | `80/90` |
+| `monitoring` | `quiet_hours` | Period for critical-only alerts | `null` |
+| `docker` | `auto_restart` | Auto restart crashed containers | `false` |
 
 ## Notification Types Supported
 
 The monitor handles various events with custom icons and priorities:
-- 🔥 **Critical Alert** (Priority 5) - CPU or RAM threshold exceeded.
-- 💾 **Storage Alert** (Priority 4) - Disk space running low.
+- 🔥 **System Alert** (Priority 4/5) - Resource thresholds exceeded.
+- 💾 **Storage Alert** (Priority 4/5) - Disk space or Inodes running low.
 - 💀 **Container Crash** (Priority 5) - Docker container exited with an error.
-- 📅 **Scheduled Status** (Priority 3) - Daily or Weekly system health summary.
+- ☁️ **Service Down** (Priority 5) - External URL check failed.
+- 🔒 **SSL/SSH Alert** (Priority 4) - SSL expiring or new SSH login detected.
+- 📅 **Scheduled Status** (Priority 3) - Daily system health summary.
 
 ## License
 
