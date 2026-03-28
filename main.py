@@ -6,10 +6,9 @@ import yaml
 import json
 import socket
 import logging
-import threading
 import re
 import ssl
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from typing import Dict, Tuple, List, Optional, Any
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
@@ -87,7 +86,7 @@ def load_config() -> Dict[str, Any]:
     if os.getenv("HOSTNAME"): config["monitoring"]["hostname"] = os.getenv("HOSTNAME")
     if os.getenv("TZ"): config["monitoring"]["timezone"] = os.getenv("TZ")
     if os.getenv("DAILY_TIME"): config["monitoring"]["daily_time"] = os.getenv("DAILY_TIME")
-    if os.getenv("CHECK_INTERVAL"): config["monitoring"]["check_interval"] = int(os.getenv("CHECK_INTERVAL"))
+    if os.getenv("CHECK_INTERVAL"): config["monitoring"]["check_interval"] = int(os.getenv("CHECK_INTERVAL") or 60)
 
     os.environ['TZ'] = config["monitoring"]["timezone"]
     if hasattr(time, 'tzset'):
@@ -438,7 +437,8 @@ async def check_ssl_expiry(name: str, url: str, days_limit: int):
             with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                 cert_bin = ssock.getpeercert(True)
                 cert = x509.load_der_x509_certificate(cert_bin, default_backend())
-                remaining = cert.not_valid_after_utc - datetime.now(timedelta(0))
+                not_after = cert.not_valid_after_utc
+                remaining = not_after - datetime.now(timezone.utc)
                 if remaining.days < days_limit:
                     await send_ntfy("SSL EXPIRY", f"Certificate for {name} ({hostname}) expires in {remaining.days} days!", "4", "lock,warning")
     except Exception as e:
@@ -555,40 +555,47 @@ async def main():
     await check_disks()
     
     # Background tasks
-    asyncio.create_task(monitor_docker_events())
+    tasks = []
+    tasks.append(asyncio.create_task(monitor_docker_events()))
     for log_cfg in config["logs"].get("watch_files", []):
-        asyncio.create_task(tail_log(log_cfg))
+        tasks.append(asyncio.create_task(tail_log(log_cfg)))
 
     last_disk_check = 0
     last_service_check = 0
     
-    while True:
-        try:
-            now = datetime.now()
-            # 1. Critical stats
-            await check_critical()
-            
-            # 2. Daily report
-            report_time = config["monitoring"]["daily_time"]
-            today = now.strftime("%Y-%m-%d")
-            if now.strftime("%H:%M") == report_time and daily_report_sent_date != today:
-                await send_report("Daily")
-                daily_report_sent_date = today
-            
-            # 3. Periodical checks
-            if time.time() - last_disk_check > 3600:
-                await check_disks()
-                await check_backups()
-                last_disk_check = time.time()
-            
-            if time.time() - last_service_check > 300: # Every 5 mins
-                await check_services()
-                last_service_check = time.time()
+    try:
+        while True:
+            try:
+                now = datetime.now()
+                # 1. Critical stats
+                await check_critical()
+                
+                # 2. Daily report
+                report_time = config["monitoring"]["daily_time"]
+                today = now.strftime("%Y-%m-%d")
+                if now.strftime("%H:%M") == report_time and daily_report_sent_date != today:
+                    await send_report("Daily")
+                    daily_report_sent_date = today
+                
+                # 3. Periodical checks
+                if time.time() - last_disk_check > 3600:
+                    await check_disks()
+                    await check_backups()
+                    last_disk_check = time.time()
+                
+                if time.time() - last_service_check > 300: # Every 5 mins
+                    await check_services()
+                    last_service_check = time.time()
 
-        except Exception as e:
-            logger.critical(f"Main loop error: {e}")
-        
-        await asyncio.sleep(config["monitoring"]["check_interval"])
+            except Exception as e:
+                logger.critical(f"Main loop error: {e}")
+            
+            await asyncio.sleep(config["monitoring"]["check_interval"])
+    finally:
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 if __name__ == "__main__":
     try:
