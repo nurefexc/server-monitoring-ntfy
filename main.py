@@ -391,6 +391,8 @@ async def monitor_docker_events():
                 
                 event = json.loads(clean)
                 action = event.get('action')
+                if not action: continue
+
                 attr = event.get('Actor', {}).get('Attributes', {})
                 c_name = attr.get('name', 'Unknown')
                 
