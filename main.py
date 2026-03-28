@@ -37,6 +37,8 @@ DEFAULT_CONFIG = {
         "disk": 90,
         "ram": 92,
         "net_mbps": 100,  # New: Network limit in Mbps
+        "swap": 80,       # New: Swap usage limit (%)
+        "inode": 90,      # New: Inode usage limit (%)
     },
     "monitoring": {
         "hostname": socket.gethostname(),
@@ -44,6 +46,7 @@ DEFAULT_CONFIG = {
         "daily_time": "08:00",
         "check_interval": 60,
         "quiet_hours": None, # Format: "23:00-06:00"
+        "heartbeat_file": "/tmp/heartbeat", # New: For Docker healthcheck
     },
     "docker": {
         "auto_restart": False,
@@ -99,7 +102,18 @@ config = load_config()
 
 # Global state
 current_disk_stats: Dict[str, float] = {}
+current_inode_stats: Dict[str, float] = {}
 last_net_bytes: Dict[str, Tuple[float, int]] = {} # {interface: (timestamp, bytes)}
+last_cpu_times: Tuple[int, int] = (0, 0) # (idle, total)
+
+def update_heartbeat() -> None:
+    hb_path = config["monitoring"].get("heartbeat_file")
+    if hb_path:
+        try:
+            with open(hb_path, 'w') as f:
+                f.write(str(int(time.time())))
+        except Exception:
+            pass
 
 def is_quiet_hours() -> bool:
     qh = config["monitoring"].get("quiet_hours")
@@ -275,8 +289,9 @@ def get_disks_usage() -> Dict[str, float]:
     Retrieves disk usage for physical devices.
     Filters out virtual filesystems related to Docker and the system.
     """
-    global current_disk_stats
+    global current_disk_stats, current_inode_stats
     disks: Dict[str, float] = {}
+    inodes: Dict[str, float] = {}
     try:
         if not os.path.exists("/proc/mounts"):
             return disks
@@ -294,10 +309,14 @@ def get_disks_usage() -> Dict[str, float]:
                             if st.f_blocks > 0:
                                 usage = round((1 - (st.f_bavail / st.f_blocks)) * 100, 1)
                                 disks[mount] = usage
+                            if st.f_files > 0:
+                                i_usage = round((1 - (st.f_favail / st.f_files)) * 100, 1)
+                                inodes[mount] = i_usage
                         except OSError:
                             continue
         current_disk_stats = disks
-        logger.info(f"Disk check completed: {disks}")
+        current_inode_stats = inodes
+        logger.info(f"Disk check completed. Disks: {disks}, Inodes: {inodes}")
     except Exception as e:
         logger.error(f"Disk scanning error: {e}")
     return disks
@@ -345,15 +364,53 @@ def get_network_usage() -> Optional[float]:
         return None
 
 
-def get_system_stats() -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+def get_cpu_usage() -> Optional[float]:
     """
-    Retrieves CPU temperature, ram usage, system load, and network traffic.
+    Calculates CPU usage percentage from /proc/stat.
+    """
+    global last_cpu_times
+    try:
+        if not os.path.exists("/proc/stat"):
+            return None
+        with open("/proc/stat", "r") as f:
+            line = f.readline()
+        
+        parts = line.split()
+        if len(parts) < 5: return None
+        
+        # cpu  user nice system idle iowait irq softirq steal guest guest_nice
+        # 0    1    2    3      4    5      6   7       8     9     10
+        idle = int(parts[4]) + int(parts[5])
+        total = sum(int(p) for p in parts[1:11])
+        
+        if last_cpu_times == (0, 0):
+            last_cpu_times = (idle, total)
+            return 0.0
+        
+        last_idle, last_total = last_cpu_times
+        idle_diff = idle - last_idle
+        total_diff = total - last_total
+        
+        last_cpu_times = (idle, total)
+        
+        if total_diff <= 0: return 0.0
+        return round(100 * (1 - idle_diff / total_diff), 1)
+    except Exception as e:
+        logger.debug(f"CPU usage error: {e}")
+        return None
+
+def get_system_stats() -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """
+    Retrieves CPU temp, cpu %, ram %, swap %, load, net, uptime.
     
     Returns:
-        Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]: (temp, ram, load, net)
+        Tuple: (temp, cpu_usage, ram, swap, load, net, uptime)
     """
-    temp, ram, load, net = None, None, None, None
+    temp, cpu_usage, ram, swap, load, net, uptime = None, None, None, None, None, None, None
     
+    # CPU usage
+    cpu_usage = get_cpu_usage()
+
     # CPU Temperature
     try:
         # Try standard hwmon paths
@@ -371,7 +428,7 @@ def get_system_stats() -> Tuple[Optional[float], Optional[float], Optional[float
     except Exception as e:
         logger.debug(f"Could not read temperature: {e}")
 
-    # RAM Usage
+    # RAM & Swap Usage
     try:
         with open('/proc/meminfo', 'r') as f:
             m = {l.split(':')[0]: l.split(':')[1].strip() for l in f}
@@ -379,8 +436,14 @@ def get_system_stats() -> Tuple[Optional[float], Optional[float], Optional[float
             total = int(m['MemTotal'].split()[0])
             available = int(m['MemAvailable'].split()[0])
             ram = round((1 - (available / total)) * 100, 1)
+        
+        if 'SwapTotal' in m and 'SwapFree' in m:
+            s_total = int(m['SwapTotal'].split()[0])
+            s_free = int(m['SwapFree'].split()[0])
+            if s_total > 0:
+                swap = round((1 - (s_free / s_total)) * 100, 1)
     except Exception as e:
-        logger.debug(f"Could not read RAM info: {e}")
+        logger.debug(f"Could not read RAM/Swap info: {e}")
 
     # Load Average
     try:
@@ -388,22 +451,99 @@ def get_system_stats() -> Tuple[Optional[float], Optional[float], Optional[float
     except Exception:
         pass
 
+    # Uptime
+    try:
+        if os.path.exists("/proc/uptime"):
+            with open("/proc/uptime", "r") as f:
+                uptime = float(f.read().split()[0])
+    except Exception:
+        pass
+
     net = get_network_usage()
 
-    return temp, ram, load, net
+    return temp, cpu_usage, ram, swap, load, net, uptime
 
+
+def get_container_stats() -> List[str]:
+    """
+    Fetches CPU and RAM usage for all running containers.
+    """
+    socket_path = "/var/run/docker.sock"
+    if not os.path.exists(socket_path):
+        return []
+    
+    stats_list = []
+    try:
+        # 1. Get running container IDs
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.connect(socket_path)
+            s.send(b"GET /containers/json HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n")
+            response = b""
+            while True:
+                data = s.recv(4096)
+                if not data: break
+                response += data
+            
+            # Simple HTTP response parsing
+            body = response.split(b"\r\n\r\n")[1]
+            containers = json.loads(body)
+            
+            for c in containers:
+                c_id = c['Id']
+                c_name = c['Names'][0].strip('/')
+                
+                # 2. Get stats for each container (one-shot)
+                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s2:
+                    s2.connect(socket_path)
+                    s2.send(f"GET /containers/{c_id}/stats?stream=false HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n".encode())
+                    resp2 = b""
+                    while True:
+                        data = s2.recv(4096)
+                        if not data: break
+                        resp2 += data
+                    
+                    try:
+                        body2 = resp2.split(b"\r\n\r\n")[1]
+                        stat_data = json.loads(body2)
+                        
+                        # RAM Usage
+                        mem_usage = stat_data.get('memory_stats', {}).get('usage', 0)
+                        mem_limit = stat_data.get('memory_stats', {}).get('limit', 1)
+                        mem_pct = round((mem_usage / mem_limit) * 100, 1) if mem_limit > 0 else 0
+                        
+                        # CPU Usage (simplified)
+                        cpu_delta = stat_data.get('cpu_stats', {}).get('cpu_usage', {}).get('total_usage', 0) - \
+                                    stat_data.get('precpu_stats', {}).get('cpu_usage', {}).get('total_usage', 0)
+                        sys_delta = stat_data.get('cpu_stats', {}).get('system_cpu_usage', 0) - \
+                                    stat_data.get('precpu_stats', {}).get('system_cpu_usage', 0)
+                        num_cpus = stat_data.get('cpu_stats', {}).get('online_cpus', 1)
+                        
+                        cpu_pct = 0.0
+                        if sys_delta > 0 and cpu_delta > 0:
+                            cpu_pct = round((cpu_delta / sys_delta) * num_cpus * 100, 1)
+                        
+                        stats_list.append(f"- {c_name}: CPU: {cpu_pct}%, RAM: {mem_pct}%")
+                    except Exception:
+                        continue
+    except Exception as e:
+        logger.debug(f"Error fetching container stats: {e}")
+    
+    return stats_list
 
 def check_critical_fast() -> None:
     """
     Quick check for critical values (Temperature, RAM, Network).
     """
-    temp, ram, load, net = get_system_stats()
+    update_heartbeat()
+    temp, cpu_usage, ram, swap, load, net, uptime = get_system_stats()
     issues: List[str] = []
     
     if temp is not None and temp >= config["limits"]["temp"]:
         issues.append(f"CPU Overheat: {temp}C")
     if ram is not None and ram >= config["limits"]["ram"]:
         issues.append(f"High RAM Usage: {ram}%")
+    if swap is not None and swap >= config["limits"]["swap"]:
+        issues.append(f"High Swap Usage: {swap}%")
     if net is not None and net >= config["limits"]["net_mbps"]:
         issues.append(f"High Network Load: {net} Mbps")
 
@@ -411,10 +551,11 @@ def check_critical_fast() -> None:
         send_ntfy("CRITICAL ALERT", "\n".join(issues), "5", "fire,warning")
     else:
         stats_str = []
-        if temp is not None: stats_str.append(f"Temp: {temp}C")
+        if temp is not None: stats_str.append(f"T: {temp}C")
+        if cpu_usage is not None: stats_str.append(f"CPU: {cpu_usage}%")
         if ram is not None: stats_str.append(f"RAM: {ram}%")
-        if load is not None: stats_str.append(f"Load: {load:.2f}")
-        if net is not None: stats_str.append(f"Net: {net} Mbps")
+        if load is not None: stats_str.append(f"L: {load:.2f}")
+        if net is not None: stats_str.append(f"N: {net} Mbps")
         logger.info(f"Health OK: {' | '.join(stats_str)}")
 
 
@@ -422,33 +563,66 @@ def check_critical_disks() -> None:
     """
     Checks disk usage based on the specified threshold.
     """
-    disks = get_disks_usage()
-    for path, used in disks.items():
+    get_disks_usage()
+    issues: List[str] = []
+    for path, used in current_disk_stats.items():
         if used >= config["limits"]["disk"]:
-            send_ntfy("STORAGE ALERT", f"Low Space on {path}: {used}%", "4", "floppy_disk")
+            issues.append(f"Low Space on {path}: {used}%")
+    
+    for path, used in current_inode_stats.items():
+        if used >= config["limits"]["inode"]:
+            issues.append(f"Low Inodes on {path}: {used}%")
+    
+    if issues:
+        send_ntfy("STORAGE ALERT", "\n".join(issues), "4", "floppy_disk,warning")
 
 
 def send_report(report_type: str = "Daily") -> None:
     """
     Sends a summary status report.
     """
-    temp, ram, load, net = get_system_stats()
+    temp, cpu_usage, ram, swap, load, net, uptime = get_system_stats()
     
-    report_lines = ["Status: Operational"]
+    report_lines = [f"Status: Operational"]
+    
+    # OS Info
+    try:
+        uname = os.uname()
+        report_lines.append(f"OS: {uname.sysname} {uname.release}")
+    except Exception:
+        pass
+
+    if uptime is not None:
+        days = int(uptime // 86400)
+        hours = int((uptime % 86400) // 3600)
+        report_lines.append(f"Uptime: {days}d {hours}h")
+
     if temp is not None:
-        report_lines.append(f"Temp: {temp}C")
+        report_lines.append(f"CPU Temp: {temp}C")
+    if cpu_usage is not None:
+        report_lines.append(f"CPU Usage: {cpu_usage}%")
+    if load is not None:
+        report_lines.append(f"Load (1m): {load:.2f}")
     if ram is not None:
         report_lines.append(f"RAM: {ram}%")
-    if load is not None:
-        report_lines.append(f"Load: {load:.2f}")
+    if swap is not None:
+        report_lines.append(f"Swap: {swap}%")
     if net is not None:
-        report_lines.append(f"Net: {net} Mbps")
+        report_lines.append(f"Network: {net} Mbps")
     
-    disk_info = "\n".join([f"- {path}: {used}%" for path, used in current_disk_stats.items()])
-    if disk_info:
-        report_lines.append(f"\nDisks:\n{disk_info}")
-    else:
-        report_lines.append("\nDisks: None detected")
+    # Disks
+    disk_lines = []
+    for path, used in current_disk_stats.items():
+        i_used = current_inode_stats.get(path, 0)
+        disk_lines.append(f"- {path}: {used}% (Inodes: {i_used}%)")
+    
+    if disk_lines:
+        report_lines.append(f"\nDisks:\n" + "\n".join(disk_lines))
+    
+    # Containers
+    c_stats = get_container_stats()
+    if c_stats:
+        report_lines.append(f"\nContainers:\n" + "\n".join(c_stats))
 
     summary = "\n".join(report_lines)
     send_report_title = f"{report_type} Status"

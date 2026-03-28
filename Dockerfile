@@ -1,34 +1,47 @@
+# --- Builder Stage ---
+FROM python:3.11-slim as builder
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+# --- Final Stage ---
 FROM python:3.11-slim
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV TZ=UTC
+ENV PATH=/home/monitor/.local/bin:$PATH
 
 LABEL maintainer="nurefexc"
 LABEL description="Server monitoring application with ntfy notifications"
 
 WORKDIR /app
 
-# Install dependencies and tzdata
-COPY requirements.txt .
-RUN apt-get update && apt-get install -y --no-install-recommends tzdata && \
-    rm -rf /var/lib/apt/lists/* && \
-    pip install --no-cache-dir -r requirements.txt
+# Install tzdata and procps (for healthcheck)
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata procps && \
+    rm -rf /var/lib/apt/lists/*
 
-# Create a non-root user and handle docker group (standard 999 or root)
-RUN groupadd -r monitor && useradd -r -g monitor monitor && \
+# Create a non-root user
+RUN groupadd -r monitor && useradd -r -g monitor -m monitor && \
     (groupadd -g 999 docker_host || groupadd docker_host) && \
     usermod -aG docker_host monitor
 
+# Copy installed packages from builder
+COPY --from=builder /root/.local /home/monitor/.local
+RUN chown -R monitor:monitor /home/monitor/.local
+
 # Copy application code
 COPY main.py .
-
-# Ensure the user has access to the app directory
-RUN chown -R monitor:monitor /app
+RUN chown monitor:monitor main.py
 
 # Run as non-root
 USER monitor
+
+# Healthcheck
+HEALTHCHECK --interval=60s --timeout=5s --start-period=10s --retries=3 \
+    CMD find /tmp/heartbeat -mmin -2 | grep . || exit 1
 
 # Run the application
 CMD ["python", "main.py"]

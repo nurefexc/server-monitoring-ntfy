@@ -20,9 +20,12 @@ A lightweight Python script that monitors system resources and Docker containers
 2. **Docker Socket (Optional):** To monitor container crashes, the script needs access to `/var/run/docker.sock`.
 
 - **Öngyógyítás (Self-Healing):** Automatikus konténer újraindítás, ha hibával áll le.
+- **Részletes Adatgyűjtés:** CPU használat, Swap memória, Uptime, OS információk és Inode használat figyelése.
+- **Docker Statisztikák:** Futó konténerek CPU és RAM használatának listázása a jelentésekben.
 - **Hálózati monitorozás:** Figyeli a forgalmat (Mbps) és riaszt, ha túl magas.
 - **Log figyelés:** Képes log fájlokban keresni kritikus hibákat (ERROR, FATAL).
 - **Csendes mód (Quiet Hours):** Éjszaka csak a kritikus riasztások jönnek meg.
+- **Docker Healthcheck:** Beépített öndiagnosztika a konténer állapotának figyeléséhez.
 - **YAML konfiguráció:** Könnyen kezelhető beállítások fájlból.
 
 ## Használat Docker Compose-al (Ajánlott)

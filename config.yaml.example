@@ -11,6 +11,8 @@ limits:
   disk: 90        # %
   ram: 92         # %
   net_mbps: 100   # Hálózati forgalom limit (Mbps)
+  swap: 80        # Swap használat limit (%)
+  inode: 90       # Inode használat limit (%)
 
 # Általános monitorozási beállítások
 monitoring:
@@ -19,6 +21,7 @@ monitoring:
   daily_time: "08:00"      # Mikor küldjön napi összefoglalót
   check_interval: 60       # Ellenőrzés gyakorisága (másodperc)
   quiet_hours: "23:00-06:00" # Ebben az időszakban csak a kritikus riasztások jönnek meg
+  heartbeat_file: "/tmp/heartbeat" # Docker healthcheck fájl útvonala
 
 # Docker specifikus beállítások
 docker:
