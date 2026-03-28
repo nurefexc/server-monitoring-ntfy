@@ -16,10 +16,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends tzdata && \
     rm -rf /var/lib/apt/lists/* && \
     pip install --no-cache-dir -r requirements.txt
 
-# Create a non-root user
+# Create a non-root user and handle docker group (standard 999 or root)
 RUN groupadd -r monitor && useradd -r -g monitor monitor && \
-    groupadd -g 999 docker_host || true && \
-    usermod -aG docker_host monitor || true
+    (groupadd -g 999 docker_host || groupadd docker_host) && \
+    usermod -aG docker_host monitor
 
 # Copy application code
 COPY main.py .
