@@ -3,7 +3,7 @@ FROM python:3.11-slim as builder
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 # --- Final Stage ---
 FROM python:3.11-slim
@@ -12,7 +12,6 @@ FROM python:3.11-slim
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 ENV TZ=UTC
-ENV PATH=/home/monitor/.local/bin:$PATH
 
 LABEL maintainer="nurefexc"
 LABEL description="Server monitoring application with ntfy notifications"
@@ -29,8 +28,8 @@ RUN groupadd -r monitor && useradd -r -g monitor -m monitor && \
     usermod -aG docker_host monitor
 
 # Copy installed packages from builder
-COPY --from=builder /root/.local /home/monitor/.local
-RUN chown -R monitor:monitor /home/monitor/.local
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy application code
 COPY main.py .
