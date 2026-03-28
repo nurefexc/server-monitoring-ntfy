@@ -437,8 +437,13 @@ async def check_ssl_expiry(name: str, url: str, days_limit: int):
             with context.wrap_socket(sock, server_hostname=hostname) as ssock:
                 cert_bin = ssock.getpeercert(True)
                 cert = x509.load_der_x509_certificate(cert_bin, default_backend())
+                now = datetime.now(timezone.utc)
                 not_after = cert.not_valid_after_utc
-                remaining = not_after - datetime.now(timezone.utc)
+                # Ensure not_after is timezone aware (it should be with not_valid_after_utc)
+                if not_after.tzinfo is None:
+                    not_after = not_after.replace(tzinfo=timezone.utc)
+                
+                remaining = not_after - now
                 if remaining.days < days_limit:
                     await send_ntfy("SSL EXPIRY", f"Certificate for {name} ({hostname}) expires in {remaining.days} days!", "4", "lock,warning")
     except Exception as e:
@@ -592,10 +597,14 @@ async def main():
             
             await asyncio.sleep(config["monitoring"]["check_interval"])
     finally:
+        logger.info("Shutting down...")
         for task in tasks:
             task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for res in results:
+                if isinstance(res, Exception) and not isinstance(res, asyncio.CancelledError):
+                    logger.error(f"Task finished with error: {res}")
 
 if __name__ == "__main__":
     try:
